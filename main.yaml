@@ -1,0 +1,321 @@
+---
+- name: NestJs App Deployment
+  hosts: hng
+  become: yes
+  vars:
+    repo_url: "https://github.com/hngprojects/hng_boilerplate_nestjs.git"
+    repo_branch: "devops"
+    dest_dir: "/opt/stage_5b"
+    log_dir: "/var/log/stage_5b"
+    pg_pw_file: "/var/secrets/pg_pw.txt"
+    db_user: postgres
+    db_password: password
+    db_name: database
+    pg_hba_conf_path: "/etc/postgresql/16/main/pg_hba.conf"
+
+  pre_tasks:
+    - name: Update the server
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - curl
+          - postgresql
+          - python3-pip
+          - python3-psycopg2
+          - acl
+          - build-essential
+        state: present
+
+    - name: Install Node.js
+      shell: |
+        curl -sL https://deb.nodesource.com/setup_14.x | bash -
+        apt-get install -y nodejs
+      args:
+        executable: /bin/bash
+
+    - name: Install npm
+      apt:
+        name: npm
+        state: present
+
+    - name: Install pm2 globally
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Create user hng with sudo privileges
+      user:
+        name: hng
+        state: present
+        groups: sudo
+        append: yes
+
+    - name: Create the log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        owner: hng
+        group: hng
+        mode: '0755'
+
+    - name: Create the error log file
+      file:
+        path: "{{ log_dir }}/error.log"
+        state: touch
+        owner: hng
+        group: hng
+        mode: '0644'
+
+    - name: Create the access log file
+      file:
+        path: "{{ log_dir }}/out.log"
+        state: touch
+        owner: hng
+        group: hng
+        mode: '0644'
+
+    - name: Ensure /var/secrets directory exists
+      file:
+        path: /var/secrets
+        state: directory
+        mode: '0700'
+
+  tasks:
+    - name: Clone repository
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ dest_dir }}"
+        version: "{{ repo_branch }}"
+        force: yes
+
+    - name: Install project dependencies
+      npm:
+        path: "{{ dest_dir }}"
+        state: present
+
+    - name: Copy environment variables
+      copy:
+        src: "{{ dest_dir }}/.env.example"
+        dest: "{{ dest_dir }}/.env"
+
+    - name: Update DB_USERNAME to postgres in .env file
+      lineinfile:
+        path: "{{ dest_dir }}/.env"
+        regexp: '^DB_USERNAME='
+        line: 'DB_USERNAME=postgres'
+
+    - name: Update DB_SSL to false in .env file
+      lineinfile:
+        path: "{{ dest_dir }}/.env"
+        regexp: '^DB_SSL='
+        line: 'DB_SSL=false'
+
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: latest
+
+    - name: Configure Nginx as a reverse proxy
+      copy:
+        content: |
+          events {
+              worker_connections 1024;
+          }
+          
+          http {
+              include       mime.types;
+              default_type  application/octet-stream;
+              sendfile        on;
+              keepalive_timeout  65;
+          
+              server {
+                  listen 80;
+                  server_name localhost;
+          
+                  location / {
+                      proxy_pass http://127.0.0.1:3000;
+                      proxy_http_version 1.1;
+                      proxy_set_header Upgrade $http_upgrade;
+                      proxy_set_header Connection 'upgrade';
+                      proxy_set_header Host $host;
+                      proxy_cache_bypass $http_upgrade;
+                  }
+          
+                  error_log /var/log/stage_5b/error.log;
+                  access_log /var/log/stage_5b/out.log;
+              }
+          }
+        dest: "/etc/nginx/nginx.conf"
+        mode: '0644'
+      notify:
+        - Restart Nginx
+
+    - name: Set password for postgres user
+      become_user: postgres
+      postgresql_user:
+        name: postgres
+        password: "{{ db_password }}"
+      notify: restart postgres
+
+    - name: Save PostgreSQL admin credentials
+      copy:
+        content: |
+          DB_USER={{ db_user }}
+          DB_PASSWORD={{ db_password }}
+          DB_NAME={{ db_name }}
+        dest: "{{ pg_pw_file }}"
+        mode: '0600'
+
+    - name: Create app database
+      postgresql_db:
+        state: present
+        name: "{{ db_name }}"
+      become: yes
+      become_user: postgres
+      environment:
+        PGUSER: "postgres"
+        PGPASSWORD: "{{ db_password }}"
+
+    - name: Compile TypeScript
+      command: npm run build
+      args:
+        chdir: "{{ dest_dir }}"
+
+    - name: Start the development server with pm2
+      command: pm2 start npm --name "nestjs-app" -- start
+      args:
+        chdir: "{{ dest_dir }}"
+
+  handlers:
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+
+    - name: restart postgres
+      service:
+        name: postgresql
+        state: restarted
+
+- name: Install and configure RabbitMQ
+  hosts: hng
+  become: yes
+  tasks:
+    - name: Install prerequisite packages
+      apt:
+        name:
+          - curl
+          - gnupg
+          - apt-transport-https
+        state: present
+
+    - name: Import RabbitMQ signing keys
+      shell: |
+        curl -1sLf "https://keys.openpgp.org/vks/v1/by-fingerprint/0A9AF2115F4687BD29803A206B73A36E6026DFCA" | gpg --dearmor | tee /usr/share/keyrings/com.rabbitmq.team.gpg > /dev/null
+        curl -1sLf https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-erlang.E495BB49CC4BBE5B.key | gpg --dearmor | tee /usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg > /dev/null
+        curl -1sLf https://github.com/rabbitmq/signing-keys/releases/download/3.0/cloudsmith.rabbitmq-server.9F4587F226208342.key | gpg --dearmor | tee /usr/share/keyrings/rabbitmq.9F4587F226208342.gpg > /dev/null
+
+    - name: Add RabbitMQ repositories
+      apt_repository:
+        repo: |
+          deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa1.novemberain.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+          deb-src [signed-by=/usr/share/keyrings/rabbitmq.E495BB49CC4BBE5B.gpg] https://ppa1.novemberain.com/rabbitmq/rabbitmq-erlang/deb/ubuntu jammy main
+          deb [arch=amd64 signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa1.novemberain.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+          deb-src [signed-by=/usr/share/keyrings/rabbitmq.9F4587F226208342.gpg] https://ppa1.novemberain.com/rabbitmq/rabbitmq-server/deb/ubuntu jammy main
+        state: present
+
+    - name: Update package lists
+      apt:
+        update_cache: yes
+
+    - name: Install Erlang and RabbitMQ server
+      apt:
+        name:
+          - erlang-base
+          - erlang-asn1
+          - erlang-crypto
+          - erlang-eldap
+          - erlang-ftp
+          - erlang-inets
+          - erlang-mnesia
+          - erlang-os-mon
+          - erlang-parsetools
+          - erlang-public-key
+          - erlang-runtime-tools
+          - erlang-snmp
+          - erlang-ssl
+          - erlang-syntax-tools
+          - erlang-tftp
+          - erlang-tools
+          - erlang-xmerl
+          - rabbitmq-server
+        state: present
+
+    - name: Enable RabbitMQ management plugin
+      command: rabbitmq-plugins enable rabbitmq_management
+      become: yes
+
+    - name: Start RabbitMQ service
+      service:
+        name: rabbitmq-server
+        state: started
+        enabled: yes
+
+    - name: Ensure RabbitMQ user exists
+      shell: |
+        if ! rabbitmqctl list_users | grep -q "my_user"; then
+          rabbitmqctl add_user my_user my_password
+          rabbitmqctl set_user_tags my_user administrator
+        fi
+      become: yes
+
+    - name: Set permissions for RabbitMQ user
+      shell: |
+        rabbitmqctl set_permissions -p / my_user ".*" ".*" ".*"
+      become: yes
+
+    - name: Ensure RabbitMQ virtual host exists
+      shell: |
+        if ! rabbitmqctl list_vhosts | grep -q "my_vhost"; then
+          rabbitmqctl add_vhost my_vhost
+        fi
+      become: yes
+
+    - name: Set permissions for RabbitMQ virtual host
+      shell: |
+        rabbitmqctl set_permissions -p my_vhost my_user ".*" ".*" ".*"
+      become: yes
+
+- name: Configure firewall to block external access to port 3000
+  hosts: hng
+  become: yes
+  tasks:
+    - name: Install UFW if not already installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: Allow port 80
+      ufw:
+        rule: allow
+        port: 80
+
+    - name: Allow port 22 for ssh access
+      ufw:
+        rule: allow
+        port: 22
+
+    - name: Allow port 15762 for Rabbit MQ
+      ufw:
+        rule: allow
+        port: 15762
