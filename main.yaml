@@ -84,7 +84,7 @@
       file:
         path: /var/secrets
         state: directory
-        mode: '0700'
+        mode: '0644'
 
   tasks:
     - name: Clone repository
