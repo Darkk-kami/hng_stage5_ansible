@@ -323,7 +323,7 @@
         rule: allow
         port: 22
 
-    - name: Allow port 15762 for Rabbit MQ
+    - name: Allow port 15672 for Rabbit MQ
       ufw:
         rule: allow
-        port: 15762
+        port: 15672
