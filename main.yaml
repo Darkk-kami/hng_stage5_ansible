@@ -78,7 +78,7 @@
         state: touch
         owner: hng
         group: hng
-        mode: '0644'
+        mode: '0644'      
 
     - name: Ensure /var/secrets directory exists
       file:
@@ -93,6 +93,13 @@
         dest: "{{ dest_dir }}"
         version: "{{ repo_branch }}"
         force: yes
+  
+    - name: Change ownership of the directory
+      file:
+        path: "{{ dest_dir }}"
+        owner: hng
+        group: hng
+        recurse: yes
 
     - name: Install project dependencies
       npm:
@@ -103,6 +110,7 @@
       copy:
         src: "{{ dest_dir }}/.env.example"
         dest: "{{ dest_dir }}/.env"
+        remote_src: yes
 
     - name: Update DB_USERNAME to postgres in .env file
       lineinfile:
